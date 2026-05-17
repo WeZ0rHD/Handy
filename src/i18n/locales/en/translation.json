@@ -486,6 +486,11 @@
         "label": "Mute While Recording",
         "description": "Mute system audio during recording"
       },
+      "reduceAudioWhileRecording": {
+        "label": "Reduce Audio While Recording",
+        "description": "Lower speaker volume during recording so your microphone doesn't pick up background music",
+        "reductionLevel": "Volume reduction level"
+      },
       "appendTrailingSpace": {
         "label": "Append Trailing Space",
         "description": "Add a space after pasted transcription"

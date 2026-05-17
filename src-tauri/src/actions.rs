@@ -424,6 +424,7 @@ impl ShortcutAction for TranscribeAction {
             std::thread::spawn(move || {
                 play_feedback_sound_blocking(&app_clone, SoundType::Start);
                 rm_clone.apply_mute();
+                rm_clone.apply_audio_reduction();
             });
 
             if let Err(e) = rm.try_start_recording(&binding_id) {
@@ -448,6 +449,7 @@ impl ShortcutAction for TranscribeAction {
                         // to keep mute sequencing consistent in every mode.
                         play_feedback_sound_blocking(&app_clone, SoundType::Start);
                         rm_clone.apply_mute();
+                        rm_clone.apply_audio_reduction();
                     });
                 }
                 Err(e) => {
@@ -506,6 +508,7 @@ impl ShortcutAction for TranscribeAction {
 
         // Unmute before playing audio feedback so the stop sound is audible
         rm.remove_mute();
+        rm.remove_audio_reduction();
 
         // Play audio feedback for recording stop
         play_feedback_sound(app, SoundType::Stop);

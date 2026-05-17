@@ -99,6 +99,125 @@ fn set_mute(mute: bool) {
     }
 }
 
+/// Sets the speaker volume to a given level (0.0 to 1.0)
+fn set_speaker_volume(level: f32) {
+    #[cfg(target_os = "windows")]
+    {
+        unsafe {
+            use windows::Win32::{
+                Media::Audio::{
+                    eMultimedia, eRender, Endpoints::IAudioEndpointVolume, IMMDeviceEnumerator,
+                    MMDeviceEnumerator,
+                },
+                System::Com::{CoCreateInstance, CoInitializeEx, CLSCTX_ALL, COINIT_MULTITHREADED},
+            };
+
+            macro_rules! unwrap_or_return {
+                ($expr:expr) => {
+                    match $expr {
+                        Ok(val) => val,
+                        Err(_) => return,
+                    }
+                };
+            }
+
+            let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
+
+            let all_devices: IMMDeviceEnumerator =
+                unwrap_or_return!(CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL));
+            let default_device =
+                unwrap_or_return!(all_devices.GetDefaultAudioEndpoint(eRender, eMultimedia));
+            let volume_interface = unwrap_or_return!(
+                default_device.Activate::<IAudioEndpointVolume>(CLSCTX_ALL, None)
+            );
+
+            let vol = level.clamp(0.0, 1.0);
+            let _ = volume_interface.SetMasterVolumeLevelScalar(vol, std::ptr::null());
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        use std::process::Command;
+        let vol_percent = (level * 100.0).clamp(0.0, 100.0) as i32;
+
+        // PipeWire
+        if Command::new("wpctl")
+            .args(["set-volume", "@DEFAULT_AUDIO_SINK", &format!("{}%", vol_percent)])
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+        {
+            return;
+        }
+
+        // PulseAudio
+        if Command::new("pactl")
+            .args(["set-sink-volume", "@DEFAULT_SINK@", &format!("{}%", vol_percent)])
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+        {
+            return;
+        }
+
+        // ALSA
+        let _ = Command::new("amixer")
+            .args(["set", "Master", &format!("{}%", vol_percent)])
+            .output();
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        use std::process::Command;
+        let vol_percent = (level * 100.0).clamp(0.0, 100.0) as i32;
+        let script = format!("set volume output volume {}", vol_percent);
+        let _ = Command::new("osascript").args(["-e", &script]).output();
+    }
+}
+
+/// Gets the current speaker volume (0.0 to 1.0)
+fn get_speaker_volume() -> f32 {
+    #[cfg(target_os = "windows")]
+    {
+        unsafe {
+            use windows::Win32::{
+                Media::Audio::{
+                    eMultimedia, eRender, Endpoints::IAudioEndpointVolume, IMMDeviceEnumerator,
+                    MMDeviceEnumerator,
+                },
+                System::Com::{CoCreateInstance, CoInitializeEx, CLSCTX_ALL, COINIT_MULTITHREADED},
+            };
+
+            macro_rules! unwrap_or_return {
+                ($expr:expr) => {
+                    match $expr {
+                        Ok(val) => val,
+                        Err(_) => return 0.5,
+                    }
+                };
+            }
+
+            let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
+
+            let all_devices: IMMDeviceEnumerator =
+                unwrap_or_return!(CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL));
+            let default_device =
+                unwrap_or_return!(all_devices.GetDefaultAudioEndpoint(eRender, eMultimedia));
+            let volume_interface = unwrap_or_return!(
+                default_device.Activate::<IAudioEndpointVolume>(CLSCTX_ALL, None)
+            );
+
+            volume_interface.GetMasterVolumeLevelScalar().unwrap_or(0.5)
+        }
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        0.5 // Default fallback
+    }
+}
+
 const WHISPER_SAMPLE_RATE: usize = 16000;
 
 /* ──────────────────────────────────────────────────────────────── */
@@ -152,6 +271,8 @@ pub struct AudioRecordingManager {
     is_open: Arc<Mutex<bool>>,
     is_recording: Arc<Mutex<bool>>,
     did_mute: Arc<Mutex<bool>>,
+    did_reduce_audio: Arc<Mutex<bool>>,
+    saved_speaker_volume: Arc<Mutex<Option<f32>>>,
     close_generation: Arc<AtomicU64>,
 }
 
@@ -175,6 +296,8 @@ impl AudioRecordingManager {
             is_open: Arc::new(Mutex::new(false)),
             is_recording: Arc::new(Mutex::new(false)),
             did_mute: Arc::new(Mutex::new(false)),
+            did_reduce_audio: Arc::new(Mutex::new(false)),
+            saved_speaker_volume: Arc::new(Mutex::new(None)),
             close_generation: Arc::new(AtomicU64::new(0)),
         };
 
@@ -260,6 +383,39 @@ impl AudioRecordingManager {
             set_mute(false);
             *did_mute_guard = false;
             debug!("Mute removed");
+        }
+    }
+
+    /// Applies audio reduction if reduce_audio_while_recording is enabled
+    pub fn apply_audio_reduction(&self) {
+        let settings = get_settings(&self.app_handle);
+        let mut did_reduce_guard = self.did_reduce_audio.lock().unwrap();
+        let mut saved_vol_guard = self.saved_speaker_volume.lock().unwrap();
+
+        if settings.reduce_audio_while_recording && !*self.is_open.lock().unwrap() {
+            // Save current volume
+            *saved_vol_guard = Some(get_speaker_volume());
+
+            // Reduce to configured level
+            let target_vol = settings.audio_reduction_level as f32 / 100.0;
+            set_speaker_volume(target_vol);
+            *did_reduce_guard = true;
+            debug!("Audio reduced to {}%", settings.audio_reduction_level);
+        }
+    }
+
+    /// Removes audio reduction and restores previous volume
+    pub fn remove_audio_reduction(&self) {
+        let mut did_reduce_guard = self.did_reduce_audio.lock().unwrap();
+        let mut saved_vol_guard = self.saved_speaker_volume.lock().unwrap();
+
+        if *did_reduce_guard {
+            if let Some(vol) = *saved_vol_guard {
+                set_speaker_volume(vol);
+                debug!("Audio restored to {}", vol);
+            }
+            *saved_vol_guard = None;
+            *did_reduce_guard = false;
         }
     }
 

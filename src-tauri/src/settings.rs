@@ -404,6 +404,10 @@ pub struct AppSettings {
     #[serde(default)]
     pub mute_while_recording: bool,
     #[serde(default)]
+    pub reduce_audio_while_recording: bool,
+    #[serde(default = "default_audio_reduction_level")]
+    pub audio_reduction_level: u8,
+    #[serde(default)]
     pub append_trailing_space: bool,
     #[serde(default = "default_app_language")]
     pub app_language: String,
@@ -481,6 +485,10 @@ fn default_word_correction_threshold() -> f64 {
 
 fn default_paste_delay_ms() -> u64 {
     60
+}
+
+fn default_audio_reduction_level() -> u8 {
+    70
 }
 
 fn default_auto_submit() -> bool {
@@ -800,6 +808,8 @@ pub fn get_default_settings() -> AppSettings {
         post_process_prompts: default_post_process_prompts(),
         post_process_selected_prompt_id: None,
         mute_while_recording: false,
+        reduce_audio_while_recording: false,
+        audio_reduction_level: default_audio_reduction_level(),
         append_trailing_space: false,
         app_language: default_app_language(),
         experimental_enabled: false,
