@@ -325,6 +325,7 @@ pub enum MicrophoneMode {
 fn create_audio_recorder(
     vad_path: &str,
     app_handle: &tauri::AppHandle,
+    vad_state_cb: Option<Arc<dyn Fn(bool) + Send + Sync + 'static>>,
 ) -> Result<AudioRecorder, anyhow::Error> {
     let silero = SileroVad::new(vad_path, 0.3)
         .map_err(|e| anyhow::anyhow!("Failed to create SileroVad: {}", e))?;
@@ -332,7 +333,7 @@ fn create_audio_recorder(
 
     // Recorder with VAD plus a spectrum-level callback that forwards updates to
     // the frontend.
-    let recorder = AudioRecorder::new()
+    let mut recorder = AudioRecorder::new()
         .map_err(|e| anyhow::anyhow!("Failed to create AudioRecorder: {}", e))?
         .with_vad(Box::new(smoothed_vad))
         .with_level_callback({
@@ -341,6 +342,10 @@ fn create_audio_recorder(
                 utils::emit_levels(&app_handle, &levels);
             }
         });
+
+    if let Some(cb) = vad_state_cb {
+        recorder = recorder.with_vad_state_callback(cb);
+    }
 
     Ok(recorder)
 }
@@ -360,6 +365,7 @@ pub struct AudioRecordingManager {
     did_reduce_audio: Arc<Mutex<bool>>,
     saved_speaker_volume: Arc<Mutex<Option<f32>>>,
     audio_volume_op: Arc<Mutex<()>>,
+    vad_state_cb: Arc<Mutex<Option<Box<dyn Fn(bool, &tauri::AppHandle) + Send + Sync>>>>,
     close_generation: Arc<AtomicU64>,
 }
 
@@ -386,6 +392,7 @@ impl AudioRecordingManager {
             did_reduce_audio: Arc::new(Mutex::new(false)),
             saved_speaker_volume: Arc::new(Mutex::new(None)),
             audio_volume_op: Arc::new(Mutex::new(())),
+            vad_state_cb: Arc::new(Mutex::new(None)),
             close_generation: Arc::new(AtomicU64::new(0)),
         };
 
@@ -509,6 +516,52 @@ impl AudioRecordingManager {
         }
     }
 
+    /// Handles VAD state changes for voice-activated auto-start recording.
+    /// Called by the VAD callback when speech is detected or ends.
+    pub fn on_vad_state_change(&self, in_speech: bool, app: &tauri::AppHandle) {
+        let settings = get_settings(app);
+
+        // Only act if voice-activated auto-start is enabled and always-on mic is on
+        if !settings.voice_activated_auto_start
+            || !matches!(*self.mode.lock().unwrap(), MicrophoneMode::AlwaysOn)
+        {
+            return;
+        }
+
+        if in_speech {
+            // VAD detected speech onset — auto-start recording if idle
+            let state = self.state.lock().unwrap();
+            if matches!(*state, RecordingState::Idle) {
+                debug!("VAD detected speech onset, auto-starting recording");
+                drop(state);
+                crate::overlay::show_voice_activated_overlay(app);
+                if let Err(e) = self.try_start_recording("voice_activated") {
+                    debug!("VAD auto-start failed: {}", e);
+                }
+            }
+        } else {
+            // VAD detected end of speech — auto-stop if voice-activated recording is active
+            let state = self.state.lock().unwrap();
+            if let RecordingState::Recording { binding_id } = &*state {
+                if binding_id == "voice_activated" {
+                    debug!("VAD detected end of speech, auto-stopping recording");
+                    drop(state);
+                    let _ = self.stop_recording("voice_activated");
+                    crate::overlay::hide_overlay(app);
+                }
+            }
+        }
+    }
+
+    /// Builds the VAD state callback closure for voice-activated recording.
+    fn make_vad_state_callback(&self) -> Option<Arc<dyn Fn(bool) + Send + Sync + 'static>> {
+        let app = self.app_handle.clone();
+        let rm = self.clone();
+        Some(Arc::new(move |in_speech: bool| {
+            rm.on_vad_state_change(in_speech, &app);
+        }))
+    }
+
     pub fn preload_vad(&self) -> Result<(), anyhow::Error> {
         let mut recorder_opt = self.recorder.lock().unwrap();
         if recorder_opt.is_none() {
@@ -523,6 +576,7 @@ impl AudioRecordingManager {
             *recorder_opt = Some(create_audio_recorder(
                 vad_path.to_str().unwrap(),
                 &self.app_handle,
+                self.make_vad_state_callback(),
             )?);
         }
         Ok(())
@@ -676,7 +730,7 @@ impl AudioRecordingManager {
         match *state {
             RecordingState::Recording {
                 binding_id: ref active,
-            } if active == binding_id => {
+            } if active == binding_id || active == "voice_activated" => {
                 *state = RecordingState::Idle;
                 drop(state);
 

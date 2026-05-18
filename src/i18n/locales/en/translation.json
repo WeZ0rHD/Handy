@@ -474,6 +474,10 @@
         "label": "Always-On Microphone",
         "description": "Keep microphone active for faster response"
       },
+      "voiceActivatedAutoStart": {
+        "label": "Voice-Activated Auto-Start",
+        "description": "Automatically start recording when speech is detected (requires Always-On Microphone)"
+      },
       "clamshellMicrophone": {
         "title": "Clamshell Microphone",
         "description": "Microphone to use when laptop lid is closed"
@@ -612,6 +616,7 @@
   },
   "overlay": {
     "transcribing": "Transcribing...",
-    "processing": "Processing..."
+    "processing": "Processing...",
+    "voiceActivated": "Voice activated — listening..."
   }
 }

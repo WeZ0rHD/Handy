@@ -354,6 +354,18 @@ pub fn show_processing_overlay(app_handle: &AppHandle) {
     show_overlay_state(app_handle, "processing");
 }
 
+/// Shows the voice-activated listening overlay
+pub fn show_voice_activated_overlay(app_handle: &AppHandle) {
+    show_overlay_state(app_handle, "voice_activated");
+}
+
+/// Hides the overlay window
+pub fn hide_overlay(app_handle: &AppHandle) {
+    if let Some(window) = app_handle.get_webview_window("overlay") {
+        let _ = window.hide();
+    }
+}
+
 /// Updates the overlay window position based on current settings
 pub fn update_overlay_position(app_handle: &AppHandle) {
     if let Some(overlay_window) = app_handle.get_webview_window("recording_overlay") {
