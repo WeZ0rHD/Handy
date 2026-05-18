@@ -112,27 +112,40 @@ fn set_speaker_volume(level: f32) {
                 System::Com::{CoCreateInstance, CoInitializeEx, CLSCTX_ALL, COINIT_MULTITHREADED},
             };
 
-            macro_rules! unwrap_or_return {
-                ($expr:expr) => {
-                    match $expr {
-                        Ok(val) => val,
-                        Err(_) => return,
-                    }
-                };
-            }
-
             let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
 
-            let all_devices: IMMDeviceEnumerator =
-                unwrap_or_return!(CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL));
-            let default_device =
-                unwrap_or_return!(all_devices.GetDefaultAudioEndpoint(eRender, eMultimedia));
-            let volume_interface = unwrap_or_return!(
-                default_device.Activate::<IAudioEndpointVolume>(CLSCTX_ALL, None)
-            );
+            let all_devices_result =
+                CoCreateInstance::<_, IMMDeviceEnumerator>(&MMDeviceEnumerator, None, CLSCTX_ALL);
+
+            let all_devices = match all_devices_result {
+                Ok(dev) => dev,
+                Err(e) => {
+                    debug!("Failed to create MMDeviceEnumerator: {:?}", e);
+                    return;
+                }
+            };
+
+            let default_device = match all_devices.GetDefaultAudioEndpoint(eRender, eMultimedia) {
+                Ok(dev) => dev,
+                Err(e) => {
+                    debug!("Failed to get default audio endpoint: {:?}", e);
+                    return;
+                }
+            };
+
+            let volume_interface =
+                match default_device.Activate::<IAudioEndpointVolume>(CLSCTX_ALL, None) {
+                    Ok(iface) => iface,
+                    Err(e) => {
+                        debug!("Failed to activate volume interface: {:?}", e);
+                        return;
+                    }
+                };
 
             let vol = level.clamp(0.0, 1.0);
-            let _ = volume_interface.SetMasterVolumeLevelScalar(vol, std::ptr::null());
+            if let Err(e) = volume_interface.SetMasterVolumeLevelScalar(vol, std::ptr::null()) {
+                debug!("Failed to set speaker volume: {:?}", e);
+            }
         }
     }
 
@@ -143,7 +156,11 @@ fn set_speaker_volume(level: f32) {
 
         // PipeWire
         if Command::new("wpctl")
-            .args(["set-volume", "@DEFAULT_AUDIO_SINK", &format!("{}%", vol_percent)])
+            .args([
+                "set-volume",
+                "@DEFAULT_AUDIO_SINK",
+                &format!("{}%", vol_percent),
+            ])
             .output()
             .map(|o| o.status.success())
             .unwrap_or(false)
@@ -153,7 +170,11 @@ fn set_speaker_volume(level: f32) {
 
         // PulseAudio
         if Command::new("pactl")
-            .args(["set-sink-volume", "@DEFAULT_SINK@", &format!("{}%", vol_percent)])
+            .args([
+                "set-sink-volume",
+                "@DEFAULT_SINK@",
+                &format!("{}%", vol_percent),
+            ])
             .output()
             .map(|o| o.status.success())
             .unwrap_or(false)
@@ -162,9 +183,13 @@ fn set_speaker_volume(level: f32) {
         }
 
         // ALSA
-        let _ = Command::new("amixer")
+        if let Err(e) = Command::new("amixer")
             .args(["set", "Master", &format!("{}%", vol_percent)])
-            .output();
+            .output()
+            .map(|o| !o.status.success())
+        {
+            debug!("ALSA volume set failed: {:?}", e);
+        }
     }
 
     #[cfg(target_os = "macos")]
@@ -172,7 +197,9 @@ fn set_speaker_volume(level: f32) {
         use std::process::Command;
         let vol_percent = (level * 100.0).clamp(0.0, 100.0) as i32;
         let script = format!("set volume output volume {}", vol_percent);
-        let _ = Command::new("osascript").args(["-e", &script]).output();
+        if let Err(e) = Command::new("osascript").args(["-e", &script]).output() {
+            debug!("macOS volume set failed: {:?}", e);
+        }
     }
 }
 
@@ -189,32 +216,91 @@ fn get_speaker_volume() -> f32 {
                 System::Com::{CoCreateInstance, CoInitializeEx, CLSCTX_ALL, COINIT_MULTITHREADED},
             };
 
-            macro_rules! unwrap_or_return {
-                ($expr:expr) => {
-                    match $expr {
-                        Ok(val) => val,
-                        Err(_) => return 0.5,
-                    }
-                };
-            }
-
             let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
 
-            let all_devices: IMMDeviceEnumerator =
-                unwrap_or_return!(CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL));
-            let default_device =
-                unwrap_or_return!(all_devices.GetDefaultAudioEndpoint(eRender, eMultimedia));
-            let volume_interface = unwrap_or_return!(
-                default_device.Activate::<IAudioEndpointVolume>(CLSCTX_ALL, None)
-            );
+            let all_devices = match CoCreateInstance::<_, IMMDeviceEnumerator>(
+                &MMDeviceEnumerator,
+                None,
+                CLSCTX_ALL,
+            ) {
+                Ok(dev) => dev,
+                Err(e) => {
+                    debug!("Failed to create MMDeviceEnumerator: {:?}", e);
+                    return 0.5;
+                }
+            };
+
+            let default_device = match all_devices.GetDefaultAudioEndpoint(eRender, eMultimedia) {
+                Ok(dev) => dev,
+                Err(e) => {
+                    debug!("Failed to get default audio endpoint: {:?}", e);
+                    return 0.5;
+                }
+            };
+
+            let volume_interface =
+                match default_device.Activate::<IAudioEndpointVolume>(CLSCTX_ALL, None) {
+                    Ok(iface) => iface,
+                    Err(e) => {
+                        debug!("Failed to activate volume interface: {:?}", e);
+                        return 0.5;
+                    }
+                };
 
             volume_interface.GetMasterVolumeLevelScalar().unwrap_or(0.5)
         }
     }
 
-    #[cfg(not(target_os = "windows"))]
+    #[cfg(target_os = "macos")]
     {
-        0.5 // Default fallback
+        use std::process::Command;
+        let output = Command::new("osascript")
+            .args(["-e", "output volume of (get volume settings)"])
+            .output();
+
+        match output {
+            Ok(out) if out.status.success() => {
+                let vol_str = String::from_utf8_lossy(&out.stdout);
+                let vol_percent: f32 = vol_str.trim().parse().unwrap_or(50.0);
+                vol_percent / 100.0
+            }
+            _ => 0.5,
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        use std::process::Command;
+
+        // Try PipeWire first (wpctl)
+        if let Ok(out) = Command::new("wpctl")
+            .args(["get-volume", "@DEFAULT_AUDIO_SINK"])
+            .output()
+        {
+            let output = String::from_utf8_lossy(&out.stdout);
+            // Format: "Volume: 0.50" or "Volume: 0.50 0.50" (mono/stereo)
+            if let Some(vol_str) = output.split_whitespace().nth(1) {
+                if let Ok(vol) = vol_str.parse::<f32>() {
+                    return vol;
+                }
+            }
+        }
+
+        // Try PulseAudio (pactl)
+        if let Ok(out) = Command::new("pactl")
+            .args(["get-sink-volume", "@DEFAULT_SINK@"])
+            .output()
+        {
+            let output = String::from_utf8_lossy(&out.stdout);
+            // Format: "Volume: 46%" or similar
+            if let Some(pct_str) = output.split_whitespace().nth(1) {
+                if let Some(pct) = pct_str.trim_end_matches('%').parse::<f32>().ok() {
+                    return pct / 100.0;
+                }
+            }
+        }
+
+        0.5 // Fallback
     }
 }
 
@@ -273,6 +359,7 @@ pub struct AudioRecordingManager {
     did_mute: Arc<Mutex<bool>>,
     did_reduce_audio: Arc<Mutex<bool>>,
     saved_speaker_volume: Arc<Mutex<Option<f32>>>,
+    audio_volume_op: Arc<Mutex<()>>,
     close_generation: Arc<AtomicU64>,
 }
 
@@ -298,6 +385,7 @@ impl AudioRecordingManager {
             did_mute: Arc::new(Mutex::new(false)),
             did_reduce_audio: Arc::new(Mutex::new(false)),
             saved_speaker_volume: Arc::new(Mutex::new(None)),
+            audio_volume_op: Arc::new(Mutex::new(())),
             close_generation: Arc::new(AtomicU64::new(0)),
         };
 
@@ -389,6 +477,7 @@ impl AudioRecordingManager {
     /// Applies audio reduction if reduce_audio_while_recording is enabled
     pub fn apply_audio_reduction(&self) {
         let settings = get_settings(&self.app_handle);
+        let _op_lock = self.audio_volume_op.lock().unwrap();
         let mut did_reduce_guard = self.did_reduce_audio.lock().unwrap();
         let mut saved_vol_guard = self.saved_speaker_volume.lock().unwrap();
 
@@ -406,6 +495,7 @@ impl AudioRecordingManager {
 
     /// Removes audio reduction and restores previous volume
     pub fn remove_audio_reduction(&self) {
+        let _op_lock = self.audio_volume_op.lock().unwrap();
         let mut did_reduce_guard = self.did_reduce_audio.lock().unwrap();
         let mut saved_vol_guard = self.saved_speaker_volume.lock().unwrap();
 
