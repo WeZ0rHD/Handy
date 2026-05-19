@@ -1,7 +1,12 @@
+use crate::audio_feedback::{play_feedback_sound_blocking, SoundType};
 use crate::audio_toolkit::{list_input_devices, vad::SmoothedVad, AudioRecorder, SileroVad};
 use crate::helpers::clamshell;
+use crate::managers::history::HistoryManager;
+use crate::managers::transcription::TranscriptionManager;
+use crate::overlay;
 use crate::settings::{get_settings, AppSettings};
-use crate::utils;
+use crate::tray::{change_tray_icon, TrayIconState};
+use crate::utils::{self, hide_recording_overlay};
 use log::{debug, error, info};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -529,14 +534,21 @@ impl AudioRecordingManager {
         }
 
         if in_speech {
-            // VAD detected speech onset — auto-start recording if idle
-            let state = self.state.lock().unwrap();
-            if matches!(*state, RecordingState::Idle) {
-                debug!("VAD detected speech onset, auto-starting recording");
-                drop(state);
-                crate::overlay::show_voice_activated_overlay(app);
-                if let Err(e) = self.try_start_recording("voice_activated") {
-                    debug!("VAD auto-start failed: {}", e);
+            // VAD detected speech onset — auto-start recording if idle and stream is open
+            let is_open = *self.is_open.lock().unwrap();
+            if is_open {
+                let state = self.state.lock().unwrap();
+                if matches!(*state, RecordingState::Idle) {
+                    debug!("VAD detected speech onset, auto-starting recording");
+                    drop(state);
+                    self.apply_mute();
+                    self.apply_audio_reduction();
+                    change_tray_icon(app, TrayIconState::Recording);
+                    crate::overlay::show_voice_activated_overlay(app);
+                    play_feedback_sound_blocking(app, SoundType::Start);
+                    if let Err(e) = self.try_start_recording("voice_activated") {
+                        debug!("VAD auto-start failed: {}", e);
+                    }
                 }
             }
         } else {
@@ -546,8 +558,103 @@ impl AudioRecordingManager {
                 if binding_id == "voice_activated" {
                     debug!("VAD detected end of speech, auto-stopping recording");
                     drop(state);
-                    let _ = self.stop_recording("voice_activated");
-                    crate::overlay::hide_overlay(app);
+                    self.remove_mute();
+                    self.remove_audio_reduction();
+                    change_tray_icon(app, TrayIconState::Transcribing);
+                    crate::overlay::show_transcribing_overlay(app);
+                    play_feedback_sound(app, SoundType::Stop);
+
+                    let samples = self.stop_recording("voice_activated");
+
+                    let app_clone = app.clone();
+                    let tm = Arc::clone(&app.state::<Arc<TranscriptionManager>>());
+                    let hm = Arc::clone(&app.state::<Arc<HistoryManager>>());
+                    let settings_clone = settings.clone();
+
+                    tauri::async_runtime::spawn(async move {
+                        if let Some(audio_samples) = samples {
+                            if audio_samples.is_empty() {
+                                utils::hide_recording_overlay(&app_clone);
+                                change_tray_icon(&app_clone, TrayIconState::Idle);
+                                return;
+                            }
+
+                            let file_name = format!("handy-{}.wav", chrono::Utc::now().timestamp());
+                            let wav_path = hm.recordings_dir().join(&file_name);
+                            let wav_path_for_verify = wav_path.clone();
+                            let samples_for_wav = audio_samples.clone();
+                            let sample_count = audio_samples.len();
+                            let wav_handle = tauri::async_runtime::spawn_blocking(move || {
+                                crate::audio_toolkit::save_wav_file(&wav_path, &samples_for_wav)
+                            });
+
+                            let transcription_result = tm.transcribe(audio_samples);
+
+                            let _wav_saved = match wav_handle.await {
+                                Ok(Ok(())) => crate::audio_toolkit::verify_wav_file(
+                                    &wav_path_for_verify,
+                                    sample_count,
+                                )
+                                .is_ok(),
+                                _ => false,
+                            };
+
+                            match transcription_result {
+                                Ok(transcription) => {
+                                    let processed = crate::actions::process_transcription_output(
+                                        &app_clone,
+                                        &transcription,
+                                        settings_clone.post_process_enabled,
+                                    )
+                                    .await;
+
+                                    if _wav_saved {
+                                        let _ = hm.save_entry(
+                                            file_name,
+                                            transcription,
+                                            settings_clone.post_process_enabled,
+                                            processed.post_processed_text.clone(),
+                                            processed.post_process_prompt.clone(),
+                                        );
+                                    }
+
+                                    if !processed.final_text.is_empty() {
+                                        let app_for_paste = app_clone.clone();
+                                        let final_text = processed.final_text;
+                                        app_clone
+                                            .run_on_main_thread(move || {
+                                                let _ =
+                                                    utils::paste(final_text, app_for_paste.clone());
+                                                utils::hide_recording_overlay(&app_for_paste);
+                                                change_tray_icon(
+                                                    &app_for_paste,
+                                                    TrayIconState::Idle,
+                                                );
+                                            })
+                                            .unwrap_or_else(|e| {
+                                                error!(
+                                                    "Failed to run paste on main thread: {:?}",
+                                                    e
+                                                );
+                                                utils::hide_recording_overlay(&app_clone);
+                                                change_tray_icon(&app_clone, TrayIconState::Idle);
+                                            });
+                                    } else {
+                                        utils::hide_recording_overlay(&app_clone);
+                                        change_tray_icon(&app_clone, TrayIconState::Idle);
+                                    }
+                                }
+                                Err(err) => {
+                                    debug!("Voice-activated transcription error: {}", err);
+                                    utils::hide_recording_overlay(&app_clone);
+                                    change_tray_icon(&app_clone, TrayIconState::Idle);
+                                }
+                            }
+                        } else {
+                            utils::hide_recording_overlay(&app_clone);
+                            change_tray_icon(&app_clone, TrayIconState::Idle);
+                        }
+                    });
                 }
             }
         }
