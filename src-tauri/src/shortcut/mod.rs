@@ -1044,9 +1044,35 @@ pub fn set_post_process_selected_prompt(app: AppHandle, id: String) -> Result<()
 
 #[tauri::command]
 #[specta::specta]
+#[tauri::command]
+#[specta::specta]
 pub fn change_mute_while_recording_setting(app: AppHandle, enabled: bool) -> Result<(), String> {
     let mut settings = settings::get_settings(&app);
     settings.mute_while_recording = enabled;
+    settings::write_settings(&app, settings);
+    Ok(())
+}
+
+#[tauri::command]
+#[specta::specta]
+pub fn change_reduce_audio_while_recording_setting(
+    app: AppHandle,
+    enabled: bool,
+) -> Result<(), String> {
+    let mut settings = settings::get_settings(&app);
+    settings.reduce_audio_while_recording = enabled;
+    settings::write_settings(&app, settings);
+    Ok(())
+}
+
+#[tauri::command]
+#[specta::specta]
+pub fn change_audio_reduction_level_setting(
+    app: AppHandle,
+    level: u8,
+) -> Result<(), String> {
+    let mut settings = settings::get_settings(&app);
+    settings.audio_reduction_level = level;
     settings::write_settings(&app, settings);
     Ok(())
 }

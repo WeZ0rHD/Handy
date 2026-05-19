@@ -39,7 +39,9 @@ export const ReduceAudioWhileRecording: React.FC<ReduceAudioWhileRecordingProps>
               min={0}
               max={100}
               step={5}
-              isUpdating={isUpdating("audio_reduction_level")}
+              label={t("settings.sound.reduceAudioWhileRecording.reductionLevel")}
+              description=""
+              descriptionMode="inline"
             />
           </div>
         )}

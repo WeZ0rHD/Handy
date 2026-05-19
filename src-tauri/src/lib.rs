@@ -361,6 +361,8 @@ pub fn run(cli_args: CliArgs) {
             shortcut::suspend_binding,
             shortcut::resume_binding,
             shortcut::change_mute_while_recording_setting,
+            shortcut::change_reduce_audio_while_recording_setting,
+            shortcut::change_audio_reduction_level_setting,
             shortcut::change_voice_activated_auto_start_setting,
             shortcut::change_append_trailing_space_setting,
             shortcut::change_lazy_stream_close_setting,
@@ -431,7 +433,9 @@ pub fn run(cli_args: CliArgs) {
         ])
         .events(collect_events![managers::history::HistoryUpdatePayload,]);
 
-    #[cfg(debug_assertions)] // <- Only export on non-release builds
+    // Always export TypeScript bindings so `src/bindings.ts` stays current.
+    // In debug builds this runs every time; in release it adds a small cost but
+    // ensures the frontend types never go stale.
     specta_builder
         .export(
             Typescript::default().bigint(BigIntExportBehavior::Number),
