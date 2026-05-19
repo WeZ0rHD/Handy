@@ -36,6 +36,7 @@ pub struct AudioRecorder {
     worker_handle: Option<std::thread::JoinHandle<()>>,
     vad: Option<Arc<Mutex<Box<dyn vad::VoiceActivityDetector>>>>,
     level_cb: Option<Arc<dyn Fn(Vec<f32>) + Send + Sync + 'static>>,
+    vad_state_cb: Option<Arc<dyn Fn(bool) + Send + Sync + 'static>>,
 }
 
 impl AudioRecorder {
@@ -46,6 +47,7 @@ impl AudioRecorder {
             worker_handle: None,
             vad: None,
             level_cb: None,
+            vad_state_cb: None,
         })
     }
 
@@ -59,6 +61,14 @@ impl AudioRecorder {
         F: Fn(Vec<f32>) + Send + Sync + 'static,
     {
         self.level_cb = Some(Arc::new(cb));
+        self
+    }
+
+    pub fn with_vad_state_callback<F>(mut self, cb: F) -> Self
+    where
+        F: Fn(bool) + Send + Sync + 'static,
+    {
+        self.vad_state_cb = Some(Arc::new(cb));
         self
     }
 
@@ -83,6 +93,7 @@ impl AudioRecorder {
         let vad = self.vad.clone();
         // Move the optional level callback into the worker thread
         let level_cb = self.level_cb.clone();
+        let vad_state_cb = self.vad_state_cb.clone();
 
         let worker = std::thread::spawn(move || {
             let stop_flag = Arc::new(AtomicBool::new(false));
@@ -159,7 +170,15 @@ impl AudioRecorder {
                 Ok((stream, sample_rate)) => {
                     let _ = init_tx.send(Ok(()));
                     // Keep the stream alive while we process samples.
-                    run_consumer(sample_rate, vad, sample_rx, cmd_rx, level_cb, stop_flag);
+                    run_consumer(
+                        sample_rate,
+                        vad,
+                        sample_rx,
+                        cmd_rx,
+                        level_cb,
+                        stop_flag,
+                        vad_state_cb,
+                    );
                     drop(stream);
                 }
                 Err(error_message) => {
@@ -399,6 +418,7 @@ fn run_consumer(
     cmd_rx: mpsc::Receiver<Cmd>,
     level_cb: Option<Arc<dyn Fn(Vec<f32>) + Send + Sync + 'static>>,
     stop_flag: Arc<AtomicBool>,
+    vad_state_cb: Option<Arc<dyn Fn(bool) + Send + Sync + 'static>>,
 ) {
     let mut frame_resampler = FrameResampler::new(
         in_sample_rate as usize,
@@ -408,6 +428,7 @@ fn run_consumer(
 
     let mut processed_samples = Vec::<f32>::new();
     let mut recording = false;
+    let mut prev_in_speech = false;
 
     // ---------- spectrum visualisation setup ---------------------------- //
     const BUCKETS: usize = 16;
@@ -425,19 +446,41 @@ fn run_consumer(
         recording: bool,
         vad: &Option<Arc<Mutex<Box<dyn vad::VoiceActivityDetector>>>>,
         out_buf: &mut Vec<f32>,
+        vad_state_cb: &Option<Arc<dyn Fn(bool) + Send + Sync + 'static>>,
+        prev_in_speech: &mut bool,
     ) {
-        if !recording {
-            return;
-        }
-
         if let Some(vad_arc) = vad {
             let mut det = vad_arc.lock().unwrap();
             match det.push_frame(samples).unwrap_or(VadFrame::Speech(samples)) {
-                VadFrame::Speech(buf) => out_buf.extend_from_slice(buf),
-                VadFrame::Noise => {}
+                VadFrame::Speech(buf) => {
+                    // Fire callback on onset transition (noise → speech)
+                    if !*prev_in_speech {
+                        if let Some(cb) = vad_state_cb {
+                            cb(true);
+                        }
+                    }
+                    *prev_in_speech = true;
+                    if recording {
+                        out_buf.extend_from_slice(buf);
+                    }
+                }
+                VadFrame::Noise => {
+                    // Fire callback on end transition (speech → noise, after hangover)
+                    if *prev_in_speech {
+                        if let Some(cb) = vad_state_cb {
+                            cb(false);
+                        }
+                    }
+                    *prev_in_speech = false;
+                    if recording {
+                        // noise frames during recording are dropped (same as before)
+                    }
+                }
             }
         } else {
-            out_buf.extend_from_slice(samples);
+            if recording {
+                out_buf.extend_from_slice(samples);
+            }
         }
     }
 
@@ -461,7 +504,14 @@ fn run_consumer(
 
         // ---------- existing pipeline ------------------------------------ //
         frame_resampler.push(&raw, &mut |frame: &[f32]| {
-            handle_frame(frame, recording, &vad, &mut processed_samples)
+            handle_frame(
+                frame,
+                recording,
+                &vad,
+                &mut processed_samples,
+                &vad_state_cb,
+                &mut prev_in_speech,
+            )
         });
 
         // non-blocking check for a command
@@ -471,6 +521,7 @@ fn run_consumer(
                     stop_flag.store(false, Ordering::Relaxed);
                     processed_samples.clear();
                     recording = true;
+                    prev_in_speech = false;
                     visualizer.reset();
                     if let Some(v) = &vad {
                         v.lock().unwrap().reset();

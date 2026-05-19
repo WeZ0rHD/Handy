@@ -474,6 +474,10 @@
         "label": "Always-On Microphone",
         "description": "Keep microphone active for faster response"
       },
+      "voiceActivatedAutoStart": {
+        "label": "Voice-Activated Auto-Start",
+        "description": "Automatically start recording when speech is detected (requires Always-On Microphone)"
+      },
       "clamshellMicrophone": {
         "title": "Clamshell Microphone",
         "description": "Microphone to use when laptop lid is closed"
@@ -485,6 +489,11 @@
       "muteWhileRecording": {
         "label": "Mute While Recording",
         "description": "Mute system audio during recording"
+      },
+      "reduceAudioWhileRecording": {
+        "label": "Reduce Audio While Recording",
+        "description": "Lower speaker volume during recording so your microphone doesn't pick up background music",
+        "reductionLevel": "Volume reduction level"
       },
       "appendTrailingSpace": {
         "label": "Append Trailing Space",
@@ -607,6 +616,7 @@
   },
   "overlay": {
     "transcribing": "Transcribing...",
-    "processing": "Processing..."
+    "processing": "Processing...",
+    "voiceActivated": "Voice activated — listening..."
   }
 }

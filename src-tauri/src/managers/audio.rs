@@ -1,7 +1,12 @@
+use crate::audio_feedback::{play_feedback_sound_blocking, SoundType};
 use crate::audio_toolkit::{list_input_devices, vad::SmoothedVad, AudioRecorder, SileroVad};
 use crate::helpers::clamshell;
+use crate::managers::history::HistoryManager;
+use crate::managers::transcription::TranscriptionManager;
+use crate::overlay;
 use crate::settings::{get_settings, AppSettings};
-use crate::utils;
+use crate::tray::{change_tray_icon, TrayIconState};
+use crate::utils::{self, hide_recording_overlay};
 use log::{debug, error, info};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -99,6 +104,211 @@ fn set_mute(mute: bool) {
     }
 }
 
+/// Sets the speaker volume to a given level (0.0 to 1.0)
+fn set_speaker_volume(level: f32) {
+    #[cfg(target_os = "windows")]
+    {
+        unsafe {
+            use windows::Win32::{
+                Media::Audio::{
+                    eMultimedia, eRender, Endpoints::IAudioEndpointVolume, IMMDeviceEnumerator,
+                    MMDeviceEnumerator,
+                },
+                System::Com::{CoCreateInstance, CoInitializeEx, CLSCTX_ALL, COINIT_MULTITHREADED},
+            };
+
+            let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
+
+            let all_devices_result =
+                CoCreateInstance::<_, IMMDeviceEnumerator>(&MMDeviceEnumerator, None, CLSCTX_ALL);
+
+            let all_devices = match all_devices_result {
+                Ok(dev) => dev,
+                Err(e) => {
+                    debug!("Failed to create MMDeviceEnumerator: {:?}", e);
+                    return;
+                }
+            };
+
+            let default_device = match all_devices.GetDefaultAudioEndpoint(eRender, eMultimedia) {
+                Ok(dev) => dev,
+                Err(e) => {
+                    debug!("Failed to get default audio endpoint: {:?}", e);
+                    return;
+                }
+            };
+
+            let volume_interface =
+                match default_device.Activate::<IAudioEndpointVolume>(CLSCTX_ALL, None) {
+                    Ok(iface) => iface,
+                    Err(e) => {
+                        debug!("Failed to activate volume interface: {:?}", e);
+                        return;
+                    }
+                };
+
+            let vol = level.clamp(0.0, 1.0);
+            if let Err(e) = volume_interface.SetMasterVolumeLevelScalar(vol, std::ptr::null()) {
+                debug!("Failed to set speaker volume: {:?}", e);
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        use std::process::Command;
+        let vol_percent = (level * 100.0).clamp(0.0, 100.0) as i32;
+
+        // PipeWire
+        if Command::new("wpctl")
+            .args([
+                "set-volume",
+                "@DEFAULT_AUDIO_SINK",
+                &format!("{}%", vol_percent),
+            ])
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+        {
+            return;
+        }
+
+        // PulseAudio
+        if Command::new("pactl")
+            .args([
+                "set-sink-volume",
+                "@DEFAULT_SINK@",
+                &format!("{}%", vol_percent),
+            ])
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+        {
+            return;
+        }
+
+        // ALSA
+        if let Err(e) = Command::new("amixer")
+            .args(["set", "Master", &format!("{}%", vol_percent)])
+            .output()
+            .map(|o| !o.status.success())
+        {
+            debug!("ALSA volume set failed: {:?}", e);
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        use std::process::Command;
+        let vol_percent = (level * 100.0).clamp(0.0, 100.0) as i32;
+        let script = format!("set volume output volume {}", vol_percent);
+        if let Err(e) = Command::new("osascript").args(["-e", &script]).output() {
+            debug!("macOS volume set failed: {:?}", e);
+        }
+    }
+}
+
+/// Gets the current speaker volume (0.0 to 1.0)
+fn get_speaker_volume() -> f32 {
+    #[cfg(target_os = "windows")]
+    {
+        unsafe {
+            use windows::Win32::{
+                Media::Audio::{
+                    eMultimedia, eRender, Endpoints::IAudioEndpointVolume, IMMDeviceEnumerator,
+                    MMDeviceEnumerator,
+                },
+                System::Com::{CoCreateInstance, CoInitializeEx, CLSCTX_ALL, COINIT_MULTITHREADED},
+            };
+
+            let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
+
+            let all_devices = match CoCreateInstance::<_, IMMDeviceEnumerator>(
+                &MMDeviceEnumerator,
+                None,
+                CLSCTX_ALL,
+            ) {
+                Ok(dev) => dev,
+                Err(e) => {
+                    debug!("Failed to create MMDeviceEnumerator: {:?}", e);
+                    return 0.5;
+                }
+            };
+
+            let default_device = match all_devices.GetDefaultAudioEndpoint(eRender, eMultimedia) {
+                Ok(dev) => dev,
+                Err(e) => {
+                    debug!("Failed to get default audio endpoint: {:?}", e);
+                    return 0.5;
+                }
+            };
+
+            let volume_interface =
+                match default_device.Activate::<IAudioEndpointVolume>(CLSCTX_ALL, None) {
+                    Ok(iface) => iface,
+                    Err(e) => {
+                        debug!("Failed to activate volume interface: {:?}", e);
+                        return 0.5;
+                    }
+                };
+
+            volume_interface.GetMasterVolumeLevelScalar().unwrap_or(0.5)
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        use std::process::Command;
+        let output = Command::new("osascript")
+            .args(["-e", "output volume of (get volume settings)"])
+            .output();
+
+        match output {
+            Ok(out) if out.status.success() => {
+                let vol_str = String::from_utf8_lossy(&out.stdout);
+                let vol_percent: f32 = vol_str.trim().parse().unwrap_or(50.0);
+                vol_percent / 100.0
+            }
+            _ => 0.5,
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        use std::process::Command;
+
+        // Try PipeWire first (wpctl)
+        if let Ok(out) = Command::new("wpctl")
+            .args(["get-volume", "@DEFAULT_AUDIO_SINK"])
+            .output()
+        {
+            let output = String::from_utf8_lossy(&out.stdout);
+            // Format: "Volume: 0.50" or "Volume: 0.50 0.50" (mono/stereo)
+            if let Some(vol_str) = output.split_whitespace().nth(1) {
+                if let Ok(vol) = vol_str.parse::<f32>() {
+                    return vol;
+                }
+            }
+        }
+
+        // Try PulseAudio (pactl)
+        if let Ok(out) = Command::new("pactl")
+            .args(["get-sink-volume", "@DEFAULT_SINK@"])
+            .output()
+        {
+            let output = String::from_utf8_lossy(&out.stdout);
+            // Format: "Volume: 46%" or similar
+            if let Some(pct_str) = output.split_whitespace().nth(1) {
+                if let Some(pct) = pct_str.trim_end_matches('%').parse::<f32>().ok() {
+                    return pct / 100.0;
+                }
+            }
+        }
+
+        0.5 // Fallback
+    }
+}
+
 const WHISPER_SAMPLE_RATE: usize = 16000;
 
 /* ──────────────────────────────────────────────────────────────── */
@@ -120,6 +330,7 @@ pub enum MicrophoneMode {
 fn create_audio_recorder(
     vad_path: &str,
     app_handle: &tauri::AppHandle,
+    vad_state_cb: Option<Arc<dyn Fn(bool) + Send + Sync + 'static>>,
 ) -> Result<AudioRecorder, anyhow::Error> {
     let silero = SileroVad::new(vad_path, 0.3)
         .map_err(|e| anyhow::anyhow!("Failed to create SileroVad: {}", e))?;
@@ -127,7 +338,7 @@ fn create_audio_recorder(
 
     // Recorder with VAD plus a spectrum-level callback that forwards updates to
     // the frontend.
-    let recorder = AudioRecorder::new()
+    let mut recorder = AudioRecorder::new()
         .map_err(|e| anyhow::anyhow!("Failed to create AudioRecorder: {}", e))?
         .with_vad(Box::new(smoothed_vad))
         .with_level_callback({
@@ -136,6 +347,10 @@ fn create_audio_recorder(
                 utils::emit_levels(&app_handle, &levels);
             }
         });
+
+    if let Some(cb) = vad_state_cb {
+        recorder = recorder.with_vad_state_callback(cb);
+    }
 
     Ok(recorder)
 }
@@ -152,6 +367,10 @@ pub struct AudioRecordingManager {
     is_open: Arc<Mutex<bool>>,
     is_recording: Arc<Mutex<bool>>,
     did_mute: Arc<Mutex<bool>>,
+    did_reduce_audio: Arc<Mutex<bool>>,
+    saved_speaker_volume: Arc<Mutex<Option<f32>>>,
+    audio_volume_op: Arc<Mutex<()>>,
+    vad_state_cb: Arc<Mutex<Option<Box<dyn Fn(bool, &tauri::AppHandle) + Send + Sync>>>>,
     close_generation: Arc<AtomicU64>,
 }
 
@@ -175,6 +394,10 @@ impl AudioRecordingManager {
             is_open: Arc::new(Mutex::new(false)),
             is_recording: Arc::new(Mutex::new(false)),
             did_mute: Arc::new(Mutex::new(false)),
+            did_reduce_audio: Arc::new(Mutex::new(false)),
+            saved_speaker_volume: Arc::new(Mutex::new(None)),
+            audio_volume_op: Arc::new(Mutex::new(())),
+            vad_state_cb: Arc::new(Mutex::new(None)),
             close_generation: Arc::new(AtomicU64::new(0)),
         };
 
@@ -263,6 +486,189 @@ impl AudioRecordingManager {
         }
     }
 
+    /// Applies audio reduction if reduce_audio_while_recording is enabled
+    pub fn apply_audio_reduction(&self) {
+        let settings = get_settings(&self.app_handle);
+        let _op_lock = self.audio_volume_op.lock().unwrap();
+        let mut did_reduce_guard = self.did_reduce_audio.lock().unwrap();
+        let mut saved_vol_guard = self.saved_speaker_volume.lock().unwrap();
+
+        if settings.reduce_audio_while_recording && !*self.is_open.lock().unwrap() {
+            // Save current volume
+            *saved_vol_guard = Some(get_speaker_volume());
+
+            // Reduce to configured level
+            let target_vol = settings.audio_reduction_level as f32 / 100.0;
+            set_speaker_volume(target_vol);
+            *did_reduce_guard = true;
+            debug!("Audio reduced to {}%", settings.audio_reduction_level);
+        }
+    }
+
+    /// Removes audio reduction and restores previous volume
+    pub fn remove_audio_reduction(&self) {
+        let _op_lock = self.audio_volume_op.lock().unwrap();
+        let mut did_reduce_guard = self.did_reduce_audio.lock().unwrap();
+        let mut saved_vol_guard = self.saved_speaker_volume.lock().unwrap();
+
+        if *did_reduce_guard {
+            if let Some(vol) = *saved_vol_guard {
+                set_speaker_volume(vol);
+                debug!("Audio restored to {}", vol);
+            }
+            *saved_vol_guard = None;
+            *did_reduce_guard = false;
+        }
+    }
+
+    /// Handles VAD state changes for voice-activated auto-start recording.
+    /// Called by the VAD callback when speech is detected or ends.
+    pub fn on_vad_state_change(&self, in_speech: bool, app: &tauri::AppHandle) {
+        let settings = get_settings(app);
+
+        // Only act if voice-activated auto-start is enabled and always-on mic is on
+        if !settings.voice_activated_auto_start
+            || !matches!(*self.mode.lock().unwrap(), MicrophoneMode::AlwaysOn)
+        {
+            return;
+        }
+
+        if in_speech {
+            // VAD detected speech onset — auto-start recording if idle and stream is open
+            let is_open = *self.is_open.lock().unwrap();
+            if is_open {
+                let state = self.state.lock().unwrap();
+                if matches!(*state, RecordingState::Idle) {
+                    debug!("VAD detected speech onset, auto-starting recording");
+                    drop(state);
+                    self.apply_mute();
+                    self.apply_audio_reduction();
+                    change_tray_icon(app, TrayIconState::Recording);
+                    crate::overlay::show_voice_activated_overlay(app);
+                    play_feedback_sound_blocking(app, SoundType::Start);
+                    if let Err(e) = self.try_start_recording("voice_activated") {
+                        debug!("VAD auto-start failed: {}", e);
+                    }
+                }
+            }
+        } else {
+            // VAD detected end of speech — auto-stop if voice-activated recording is active
+            let state = self.state.lock().unwrap();
+            if let RecordingState::Recording { binding_id } = &*state {
+                if binding_id == "voice_activated" {
+                    debug!("VAD detected end of speech, auto-stopping recording");
+                    drop(state);
+                    self.remove_mute();
+                    self.remove_audio_reduction();
+                    change_tray_icon(app, TrayIconState::Transcribing);
+                    crate::overlay::show_transcribing_overlay(app);
+                    play_feedback_sound(app, SoundType::Stop);
+
+                    let samples = self.stop_recording("voice_activated");
+
+                    let app_clone = app.clone();
+                    let tm = Arc::clone(&app.state::<Arc<TranscriptionManager>>());
+                    let hm = Arc::clone(&app.state::<Arc<HistoryManager>>());
+                    let settings_clone = settings.clone();
+
+                    tauri::async_runtime::spawn(async move {
+                        if let Some(audio_samples) = samples {
+                            if audio_samples.is_empty() {
+                                utils::hide_recording_overlay(&app_clone);
+                                change_tray_icon(&app_clone, TrayIconState::Idle);
+                                return;
+                            }
+
+                            let file_name = format!("handy-{}.wav", chrono::Utc::now().timestamp());
+                            let wav_path = hm.recordings_dir().join(&file_name);
+                            let wav_path_for_verify = wav_path.clone();
+                            let samples_for_wav = audio_samples.clone();
+                            let sample_count = audio_samples.len();
+                            let wav_handle = tauri::async_runtime::spawn_blocking(move || {
+                                crate::audio_toolkit::save_wav_file(&wav_path, &samples_for_wav)
+                            });
+
+                            let transcription_result = tm.transcribe(audio_samples);
+
+                            let _wav_saved = match wav_handle.await {
+                                Ok(Ok(())) => crate::audio_toolkit::verify_wav_file(
+                                    &wav_path_for_verify,
+                                    sample_count,
+                                )
+                                .is_ok(),
+                                _ => false,
+                            };
+
+                            match transcription_result {
+                                Ok(transcription) => {
+                                    let processed = crate::actions::process_transcription_output(
+                                        &app_clone,
+                                        &transcription,
+                                        settings_clone.post_process_enabled,
+                                    )
+                                    .await;
+
+                                    if _wav_saved {
+                                        let _ = hm.save_entry(
+                                            file_name,
+                                            transcription,
+                                            settings_clone.post_process_enabled,
+                                            processed.post_processed_text.clone(),
+                                            processed.post_process_prompt.clone(),
+                                        );
+                                    }
+
+                                    if !processed.final_text.is_empty() {
+                                        let app_for_paste = app_clone.clone();
+                                        let final_text = processed.final_text;
+                                        app_clone
+                                            .run_on_main_thread(move || {
+                                                let _ =
+                                                    utils::paste(final_text, app_for_paste.clone());
+                                                utils::hide_recording_overlay(&app_for_paste);
+                                                change_tray_icon(
+                                                    &app_for_paste,
+                                                    TrayIconState::Idle,
+                                                );
+                                            })
+                                            .unwrap_or_else(|e| {
+                                                error!(
+                                                    "Failed to run paste on main thread: {:?}",
+                                                    e
+                                                );
+                                                utils::hide_recording_overlay(&app_clone);
+                                                change_tray_icon(&app_clone, TrayIconState::Idle);
+                                            });
+                                    } else {
+                                        utils::hide_recording_overlay(&app_clone);
+                                        change_tray_icon(&app_clone, TrayIconState::Idle);
+                                    }
+                                }
+                                Err(err) => {
+                                    debug!("Voice-activated transcription error: {}", err);
+                                    utils::hide_recording_overlay(&app_clone);
+                                    change_tray_icon(&app_clone, TrayIconState::Idle);
+                                }
+                            }
+                        } else {
+                            utils::hide_recording_overlay(&app_clone);
+                            change_tray_icon(&app_clone, TrayIconState::Idle);
+                        }
+                    });
+                }
+            }
+        }
+    }
+
+    /// Builds the VAD state callback closure for voice-activated recording.
+    fn make_vad_state_callback(&self) -> Option<Arc<dyn Fn(bool) + Send + Sync + 'static>> {
+        let app = self.app_handle.clone();
+        let rm = self.clone();
+        Some(Arc::new(move |in_speech: bool| {
+            rm.on_vad_state_change(in_speech, &app);
+        }))
+    }
+
     pub fn preload_vad(&self) -> Result<(), anyhow::Error> {
         let mut recorder_opt = self.recorder.lock().unwrap();
         if recorder_opt.is_none() {
@@ -277,6 +683,7 @@ impl AudioRecordingManager {
             *recorder_opt = Some(create_audio_recorder(
                 vad_path.to_str().unwrap(),
                 &self.app_handle,
+                self.make_vad_state_callback(),
             )?);
         }
         Ok(())
@@ -430,7 +837,7 @@ impl AudioRecordingManager {
         match *state {
             RecordingState::Recording {
                 binding_id: ref active,
-            } if active == binding_id => {
+            } if active == binding_id || active == "voice_activated" => {
                 *state = RecordingState::Idle;
                 drop(state);
 

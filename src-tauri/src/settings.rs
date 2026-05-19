@@ -354,6 +354,8 @@ pub struct AppSettings {
     #[serde(default = "default_always_on_microphone")]
     pub always_on_microphone: bool,
     #[serde(default)]
+    pub voice_activated_auto_start: bool,
+    #[serde(default)]
     pub selected_microphone: Option<String>,
     #[serde(default)]
     pub clamshell_microphone: Option<String>,
@@ -404,6 +406,10 @@ pub struct AppSettings {
     #[serde(default)]
     pub mute_while_recording: bool,
     #[serde(default)]
+    pub reduce_audio_while_recording: bool,
+    #[serde(default = "default_audio_reduction_level")]
+    pub audio_reduction_level: u8,
+    #[serde(default)]
     pub append_trailing_space: bool,
     #[serde(default = "default_app_language")]
     pub app_language: String,
@@ -437,6 +443,10 @@ fn default_model() -> String {
 }
 
 fn default_always_on_microphone() -> bool {
+    false
+}
+
+fn default_voice_activated_auto_start() -> bool {
     false
 }
 
@@ -481,6 +491,10 @@ fn default_word_correction_threshold() -> f64 {
 
 fn default_paste_delay_ms() -> u64 {
     60
+}
+
+fn default_audio_reduction_level() -> u8 {
+    70
 }
 
 fn default_auto_submit() -> bool {
@@ -775,6 +789,7 @@ pub fn get_default_settings() -> AppSettings {
         update_checks_enabled: default_update_checks_enabled(),
         selected_model: "".to_string(),
         always_on_microphone: false,
+        voice_activated_auto_start: false,
         selected_microphone: None,
         clamshell_microphone: None,
         selected_output_device: None,
@@ -800,6 +815,8 @@ pub fn get_default_settings() -> AppSettings {
         post_process_prompts: default_post_process_prompts(),
         post_process_selected_prompt_id: None,
         mute_while_recording: false,
+        reduce_audio_while_recording: false,
+        audio_reduction_level: default_audio_reduction_level(),
         append_trailing_space: false,
         app_language: default_app_language(),
         experimental_enabled: false,

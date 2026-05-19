@@ -6,6 +6,7 @@ import { PasteDelay } from "./PasteDelay";
 import { RecordingBuffer } from "./RecordingBuffer";
 import { SettingsGroup } from "../../ui/SettingsGroup";
 import { AlwaysOnMicrophone } from "../AlwaysOnMicrophone";
+import { VoiceActivatedAutoStart } from "../VoiceActivatedAutoStart";
 import { SoundPicker } from "../SoundPicker";
 import { ClamshellMicrophoneSelector } from "../ClamshellMicrophoneSelector";
 import { UpdateChecksToggle } from "../UpdateChecksToggle";
@@ -26,6 +27,7 @@ export const DebugSettings: React.FC = () => {
         <PasteDelay descriptionMode="tooltip" grouped={true} />
         <RecordingBuffer descriptionMode="tooltip" grouped={true} />
         <AlwaysOnMicrophone descriptionMode="tooltip" grouped={true} />
+        <VoiceActivatedAutoStart descriptionMode="tooltip" grouped={true} />
         <ClamshellMicrophoneSelector descriptionMode="tooltip" grouped={true} />
       </SettingsGroup>
     </div>

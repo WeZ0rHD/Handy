@@ -178,6 +178,15 @@ pub fn get_microphone_mode(app: AppHandle) -> Result<bool, String> {
 
 #[tauri::command]
 #[specta::specta]
+pub fn update_voice_activated_auto_start(app: AppHandle, enabled: bool) -> Result<(), String> {
+    let mut settings = get_settings(&app);
+    settings.voice_activated_auto_start = enabled;
+    write_settings(&app, settings);
+    Ok(())
+}
+
+#[tauri::command]
+#[specta::specta]
 pub fn get_available_microphones() -> Result<Vec<AudioDevice>, String> {
     let devices =
         list_input_devices().map_err(|e| format!("Failed to list audio devices: {}", e))?;
